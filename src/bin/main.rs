@@ -2,45 +2,38 @@ use std::thread;
 use std::time::Duration;
 use zmq;
 
-fn raft_node(name: &str) {
+struct NodeConfig {
+    id: &'static str,
+    addr: &'static str,
+}
+
+const nodes: [NodeConfig; 4] = [
+    NodeConfig { id: "1", addr: "" },
+    NodeConfig { id: "2", addr: "" },
+    NodeConfig { id: "3", addr: "" },
+    NodeConfig { id: "4", addr: "" },
+];
+
+struct Network {
+    current_node: NodeConfig,
+    other_nodes: std::vec::Vec<NodeConfig>,
+}
+
+impl Network {
+    fn send<T>(&self, to: &str, t: T) -> Option<()> {
+        None
+    }
+
+    fn recv<T>(&self, from: &str, t: T) -> Option<()> {
+        None
+    }
+}
+
+fn raft_node(id: &str) {
     let ctx = zmq::Context::new();
     let requester = ctx.socket(zmq::REQ).unwrap();
 
     assert!(requester.connect("tcp://localhost:5555").is_ok());
-}
-
-fn client() {
-    println!("Connecting to hello world server...\n");
-
-    let context = zmq::Context::new();
-    let requester = context.socket(zmq::REQ).unwrap();
-
-    assert!(requester.connect("tcp://localhost:5555").is_ok());
-
-    let mut msg = zmq::Message::new();
-
-    for request_nbr in 0..10 {
-        println!("Sending Hello {}...", request_nbr);
-        requester.send("Hello", 0).unwrap();
-
-        requester.recv(&mut msg, 0).unwrap();
-        println!("Received World {}: {}", msg.as_str().unwrap(), request_nbr);
-    }
-}
-
-fn server() {
-    let context = zmq::Context::new();
-    let responder = context.socket(zmq::REP).unwrap();
-
-    assert!(responder.bind("tcp://localhost:5555").is_ok());
-
-    let mut msg = zmq::Message::new();
-    loop {
-        responder.recv(&mut msg, 0).unwrap();
-        println!("Received {}", msg.as_str().unwrap());
-        thread::sleep(Duration::from_millis(1000));
-        responder.send("World", 0).unwrap();
-    }
 }
 
 fn main() {
