@@ -1,6 +1,6 @@
 use serde;
 use serde::{Deserialize, Serialize};
-use serde_json::{Result as JsonResult, Value};
+use serde_json;
 use zmq;
 
 type NodeId = u32;
@@ -48,11 +48,13 @@ enum Message {
     RequestVoteReply(NodeId, bool),
 }
 
+#[derive(Serialize, Deserialize, Debug)]
 enum Operation {
     Get,
     Set,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
 struct Entry {
     op: Operation,
     key: String,
@@ -121,19 +123,27 @@ impl RaftNode {
         }
     }
 
+    fn recieve_message(&mut self) -> Option<Message> {
+        if let Ok(msg) = self
+            .reciever
+            .recv_string(0)
+            .expect("Error converting recieved Message to string")
+        {
+            let msg: Message =
+                serde_json::from_str(&msg).expect("Error decoding Message in transit");
+            Some(msg)
+        } else {
+            None
+        }
+    }
+
     pub fn start(&mut self) {
         let node = &self.network_nodes[0];
 
         node.send_message(&Message::RequestVoteReply(self.node_id, true));
 
         loop {
-            if let Ok(msg) = self
-                .reciever
-                .recv_string(0)
-                .expect("Error converting recieved Message to string")
-            {
-                let msg: Message =
-                    serde_json::from_str(&msg).expect("Error decoding Message in transit");
+            if let Some(msg) = self.recieve_message() {
                 println!("Node {}: Got msg {:?}", self.node_id, msg);
             }
         }
