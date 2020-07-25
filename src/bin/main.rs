@@ -1,47 +1,28 @@
 use std::thread;
-use std::time::Duration;
-use zmq;
-
-struct NodeConfig {
-    id: &'static str,
-    addr: &'static str,
-}
-
-const nodes: [NodeConfig; 4] = [
-    NodeConfig { id: "1", addr: "" },
-    NodeConfig { id: "2", addr: "" },
-    NodeConfig { id: "3", addr: "" },
-    NodeConfig { id: "4", addr: "" },
-];
-
-struct Network {
-    current_node: NodeConfig,
-    other_nodes: std::vec::Vec<NodeConfig>,
-}
-
-impl Network {
-    fn send<T>(&self, to: &str, t: T) -> Option<()> {
-        None
-    }
-
-    fn recv<T>(&self, from: &str, t: T) -> Option<()> {
-        None
-    }
-}
-
-fn raft_node(id: &str) {
-    let ctx = zmq::Context::new();
-    let requester = ctx.socket(zmq::REQ).unwrap();
-
-    assert!(requester.connect("tcp://localhost:5555").is_ok());
-}
+use Raft::RaftNode;
 
 fn main() {
-    let names = vec!["1", "2"];
+    let node_configs = vec![
+        (1, "tcp://127.0.0.1:5551"),
+        (2, "tcp://127.0.0.1:5552"),
+        (3, "tcp://127.0.0.1:5553"),
+    ];
+
     let mut threads = vec![];
 
-    for name in names {
-        let handle = thread::spawn(move || raft_node(name));
+    for node_config in node_configs.iter() {
+        let (node_id, node_addr) = node_config.clone();
+        let node_configs = node_configs.clone();
+
+        let handle = thread::spawn(move || {
+            let other_nodes: Vec<(u32, &str)> = node_configs
+                .into_iter()
+                .filter(|config| *config != (node_id, node_addr))
+                .collect();
+
+            let mut raft_node = RaftNode::new(node_id, node_addr, other_nodes);
+            raft_node.start();
+        });
         threads.push(handle);
     }
 
