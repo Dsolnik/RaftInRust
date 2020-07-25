@@ -3,10 +3,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Result as JsonResult, Value};
 use zmq;
 
+type NodeId = u32;
+
 struct NetworkNode {
     sender: zmq::Socket,
     addr: &'static str,
-    id: u32,
+    id: NodeId,
 }
 
 impl NetworkNode {
@@ -27,14 +29,15 @@ impl NetworkNode {
 struct RequestVoteRPC {
     term: u32,
     candidate_id: String,
-    last_log_index: i32,
-    last_log_term: i32,
+    last_log_index: u32,
+    last_log_term: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+// The first element of each option is the node it is from
 enum Message {
-    RequestVote(RequestVoteRPC),
-    RequestVoteReply(bool),
+    RequestVote(NodeId, RequestVoteRPC),
+    RequestVoteReply(NodeId, bool),
 }
 
 enum Operation {
@@ -51,7 +54,7 @@ struct Entry {
 pub struct RaftNode {
     network_nodes: Vec<NetworkNode>,
     reciever: zmq::Socket,
-    node_id: u32,
+    node_id: NodeId,
     // Persistent State
     current_term: u32,
     voted_for: Option<u32>,
@@ -66,7 +69,7 @@ pub struct RaftNode {
 
 impl RaftNode {
     pub fn new(
-        node_id: u32,
+        node_id: NodeId,
         node_addr: &'static str,
         other_nodes: Vec<(u32, &'static str)>,
     ) -> RaftNode {
@@ -101,18 +104,25 @@ impl RaftNode {
         }
     }
 
-    pub fn start(&mut self) -> zmq::Result<()> {
+    pub fn start(&mut self) {
         let node = &self.network_nodes[0];
 
-        let message = Message::RequestVoteReply(true);
+        let message = Message::RequestVoteReply(self.node_id, true);
         let message = serde_json::to_string(&message).expect("Error serializing Message to send");
 
-        node.sender.send(&message, 0)?;
+        node.sender
+            .send(&message, 0)
+            .expect("Error sending Message with zmq");
+
         loop {
-            if let Ok(msg) = self.reciever.recv_string(0)? {
+            if let Ok(msg) = self
+                .reciever
+                .recv_string(0)
+                .expect("Error converting recieved Message to string")
+            {
                 let msg: Message =
                     serde_json::from_str(&msg).expect("Error decoding Message in transit");
-                println!("Node {}: Got msg {:#?}", self.node_id, msg);
+                println!("Node {}: Got msg {:?}", self.node_id, msg);
             }
         }
     }
