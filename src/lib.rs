@@ -12,6 +12,7 @@ struct NetworkNode {
 }
 
 impl NetworkNode {
+    // Create an interface to send messages to the node
     pub fn new(id: u32, addr: &'static str, ctx: &zmq::Context) -> NetworkNode {
         let sender = ctx
             .socket(zmq::PUSH)
@@ -24,6 +25,7 @@ impl NetworkNode {
         NetworkNode { sender, addr, id }
     }
 
+    // Send a message to this node
     fn send_message(&self, message: &Message) {
         let message = serde_json::to_string(message).expect("Error serializing Message to send");
 
@@ -42,7 +44,7 @@ struct RequestVoteRPC {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-// The first element of each option is the node it is from
+//* The first element of each option is the node it is from
 enum Message {
     RequestVote(NodeId, RequestVoteRPC),
     RequestVoteReply(NodeId, bool),
