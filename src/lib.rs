@@ -23,6 +23,14 @@ impl NetworkNode {
 
         NetworkNode { sender, addr, id }
     }
+
+    fn send_message(&self, message: &Message) {
+        let message = serde_json::to_string(message).expect("Error serializing Message to send");
+
+        self.sender
+            .send(&message, 0)
+            .expect("Error sending Message with zmq");
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -68,13 +76,11 @@ pub struct RaftNode {
 }
 
 impl RaftNode {
-    pub fn new(
+    fn setup_pull_socket(
         node_id: NodeId,
         node_addr: &'static str,
-        other_nodes: Vec<(u32, &'static str)>,
-    ) -> RaftNode {
-        let ctx = zmq::Context::new();
-
+        ctx: &zmq::Context,
+    ) -> zmq::Socket {
         let reciever = ctx.socket(zmq::PULL).expect(&format!(
             "Node {}: Error creating PULL Socket at {}",
             node_id, node_addr
@@ -84,6 +90,17 @@ impl RaftNode {
             "Node {}: Error binding PULL Socket at {}",
             node_id, node_addr
         ));
+        reciever
+    }
+
+    pub fn new(
+        node_id: NodeId,
+        node_addr: &'static str,
+        other_nodes: Vec<(u32, &'static str)>,
+    ) -> RaftNode {
+        let ctx = zmq::Context::new();
+
+        let reciever = RaftNode::setup_pull_socket(node_id, node_addr, &ctx);
 
         let network_nodes: Vec<NetworkNode> = other_nodes
             .into_iter()
@@ -107,12 +124,7 @@ impl RaftNode {
     pub fn start(&mut self) {
         let node = &self.network_nodes[0];
 
-        let message = Message::RequestVoteReply(self.node_id, true);
-        let message = serde_json::to_string(&message).expect("Error serializing Message to send");
-
-        node.sender
-            .send(&message, 0)
-            .expect("Error sending Message with zmq");
+        node.send_message(&Message::RequestVoteReply(self.node_id, true));
 
         loop {
             if let Ok(msg) = self
