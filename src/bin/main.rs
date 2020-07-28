@@ -9,24 +9,22 @@ fn main() {
     ];
 
     let mut threads = vec![];
-
     for node_config in node_configs.iter() {
         let (node_id, node_addr) = node_config.clone();
-        let node_configs = node_configs.clone();
+        let other_nodes: Vec<(u32, &str)> = node_configs
+            .clone()
+            .into_iter()
+            .filter(|&config| config != (node_id, node_addr))
+            .collect();
 
         let handle = thread::spawn(move || {
-            let other_nodes: Vec<(u32, &str)> = node_configs
-                .into_iter()
-                .filter(|config| *config != (node_id, node_addr))
-                .collect();
-
             let mut raft_node = RaftNode::new(node_id, node_addr, other_nodes);
             raft_node.start().expect("Error running the Raft Node");
         });
         threads.push(handle);
     }
 
-    for handle in threads {
-        handle.join().unwrap();
-    }
+    threads
+        .into_iter()
+        .for_each(|handle| handle.join().unwrap());
 }
