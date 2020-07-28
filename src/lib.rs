@@ -34,12 +34,9 @@ impl NetworkNode {
     }
 
     // Send a message to this node
-    fn send_message(&self, from: NodeId, msg: &Message) -> Result<(), zmq::Error> {
-        let message = serde_json::to_string(&NetworkMessage {
-            from,
-            msg: msg.clone(),
-        })
-        .expect("Error serializing Message to send");
+    fn send_message(&self, from: NodeId, msg: Message) -> Result<(), zmq::Error> {
+        let message = serde_json::to_string(&NetworkMessage { from, msg })
+            .expect("Error serializing Message to send");
         self.sender.send(&message, 0)?;
         Ok(())
     }
@@ -157,7 +154,7 @@ impl RaftNode {
 
     fn broadcast_message(&self, msg: &Message) -> Result<(), zmq::Error> {
         for node in self.network_nodes.iter() {
-            node.send_message(self.node_id, msg)?;
+            node.send_message(self.node_id, msg.clone())?;
         }
         Ok(())
     }
@@ -232,15 +229,15 @@ impl RaftNode {
             Message::RequestVote(vote_request) => {
                 // 1. Reply false if term < currentTerm (§5.1)
                 if vote_request.term < self.current_term {
-                    node.send_message(self.node_id, &Message::RequestVoteReply(false))?;
+                    node.send_message(self.node_id, Message::RequestVoteReply(false))?;
                 } else if self.voted_for.is_none() {
                     // TODO: step 2 conditions (page 4)
                     // 2. If votedFor is null or candidateId, and candidate’s log is at
                     //  least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
                     self.voted_for = Some(node.node_id);
-                    node.send_message(self.node_id, &Message::RequestVoteReply(true))?;
+                    node.send_message(self.node_id, Message::RequestVoteReply(true))?;
                 } else {
-                    node.send_message(self.node_id, &Message::RequestVoteReply(false))?;
+                    node.send_message(self.node_id, Message::RequestVoteReply(false))?;
                 }
             }
             _ => {}
