@@ -21,7 +21,7 @@ fn main() {
                 .collect();
 
             let mut raft_node = RaftNode::new(node_id, node_addr, other_nodes);
-            raft_node.start();
+            raft_node.start().expect("Error running the Raft Node");
         });
         threads.push(handle);
     }
