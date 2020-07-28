@@ -1,6 +1,9 @@
+use rand::Rng;
 use serde;
 use serde::{Deserialize, Serialize};
 use serde_json;
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
 use zmq;
 
 type NodeId = u32;
@@ -38,8 +41,9 @@ impl NetworkNode {
 #[derive(Serialize, Deserialize, Debug)]
 struct RequestVoteRPC {
     term: u32,
-    candidate_id: String,
+    candidate_id: NodeId,
     last_log_index: u32,
+    //  TODO: Should be an Entry
     last_log_term: u32,
 }
 
@@ -77,6 +81,11 @@ pub struct RaftNode {
     // Leader State
     next_index: Vec<u32>,
     match_index: Vec<u32>,
+    // Election timeout
+    election_timeout: Option<i32>,
+    election_timeout_instant: Option<Instant>,
+    // Election State
+    voters: Option<HashSet<NodeId>>,
 }
 
 impl RaftNode {
@@ -95,6 +104,11 @@ impl RaftNode {
             node_id, node_addr
         ));
         reciever
+    }
+
+    pub fn get_new_timeout_time(bottom: i32, top: i32) -> i32 {
+        let mut thread_rng = rand::thread_rng();
+        thread_rng.gen_range(bottom, top)
     }
 
     pub fn new(
@@ -122,31 +136,120 @@ impl RaftNode {
             last_applied: 0,
             next_index: vec![],
             match_index: vec![],
+            election_timeout: Some(RaftNode::get_new_timeout_time(5000, 10000)),
+            election_timeout_instant: Some(Instant::now()),
+            voters: None,
         }
     }
 
-    fn recieve_message(&mut self) -> Option<Message> {
-        if let Ok(msg) = self
-            .reciever
-            .recv_string(0)
-            .expect("Error converting recieved Message to string")
-        {
+    fn broadcast_message(&self, msg: &Message) -> Result<(), zmq::Error> {
+        for node in self.network_nodes.iter() {
+            node.send_message(msg)
+        }
+        Ok(())
+    }
+
+    fn recieve_message(&mut self, timeout: i64) -> Result<Option<Message>, zmq::Error> {
+        let val = self.reciever.poll(zmq::POLLIN, timeout)?;
+        if val == 1 {
+            let msg = self
+                .reciever
+                .recv_string(0)
+                .expect("Error converting recieved Message to string")
+                .expect("Should be read because Poll returned");
             let msg: Message =
                 serde_json::from_str(&msg).expect("Error decoding Message in transit");
-            Some(msg)
+            Ok(Some(msg))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn timed_out(&self) -> bool {
+        if let Some(time_left) = self.time_before_timeout() {
+            time_left <= 0
+        } else {
+            false
+        }
+    }
+
+    fn time_before_timeout(&self) -> Option<i32> {
+        if let (Some(instant), Some(election_timeout)) =
+            (self.election_timeout_instant, self.election_timeout)
+        {
+            Some(election_timeout - instant.elapsed().as_millis() as i32)
         } else {
             None
         }
     }
 
-    pub fn start(&mut self) {
-        let node = &self.network_nodes[0];
+    fn restart_election_timer(&mut self) {
+        self.election_timeout_instant = Some(Instant::now());
+        self.election_timeout = Some(RaftNode::get_new_timeout_time(5000, 10000));
+    }
 
-        node.send_message(&Message::RequestVoteReply(self.node_id, true));
+    fn register_new_vote(&mut self, node: NodeId) {
+        println!("Node {}: Recieved a vote from node {}", self.node_id, node);
+        let voters = self.voters.as_mut().unwrap();
+        voters.insert(node);
+    }
+
+    fn start_candidacy(&mut self) -> Result<(), zmq::Error> {
+        self.current_term += 1;
+
+        // Reset the voters hash set
+        self.voters = Some(HashSet::new());
+
+        // Vote for ourself
+        self.register_new_vote(self.node_id);
+        self.voted_for = Some(self.node_id);
+
+        self.restart_election_timer();
+
+        let message = Message::RequestVote(
+            self.node_id,
+            RequestVoteRPC {
+                term: self.current_term,
+                candidate_id: self.node_id,
+                last_log_index: 0,
+                last_log_term: 0,
+            },
+        );
+        self.broadcast_message(&message)?;
+        Ok(())
+    }
+
+    fn handle_msg(&mut self, msg: Message) {
+        match msg {
+            Message::RequestVoteReply(node_from, vote) => {
+                if vote == true {
+                    self.register_new_vote(node_from)
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn start(&mut self) -> Result<(), zmq::Error> {
+        // let node = &self.network_nodes[0];
+
+        // let election_timeout = node.send_message(&Message::RequestVoteReply(self.node_id, true));
 
         loop {
-            if let Some(msg) = self.recieve_message() {
+            // Check if election has timed out
+            if self.timed_out() {
+                self.start_candidacy()?;
+                continue;
+            }
+
+            let time_left: i64 = match self.time_before_timeout() {
+                Some(time) => time as i64,
+                None => 10000000000,
+            };
+
+            if let Some(msg) = self.recieve_message(time_left)? {
                 println!("Node {}: Got msg {:?}", self.node_id, msg);
+                self.handle_msg(msg);
             }
         }
     }
