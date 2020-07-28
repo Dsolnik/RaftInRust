@@ -3,7 +3,7 @@ use serde;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use zmq;
 
 type NodeId = u32;
