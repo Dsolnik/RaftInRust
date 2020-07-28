@@ -254,9 +254,9 @@ impl RaftNode {
 
     pub fn start(&mut self) -> Result<(), zmq::Error> {
         println!("Node {} starting...", self.node_id);
-        // let node = &self.network_nodes[0];
+        //// let node = &self.network_nodes[0];
 
-        // let election_timeout = node.send_message(&Message::RequestVoteReply(self.node_id, true));
+        //// let election_timeout = node.send_message(&Message::RequestVoteReply(self.node_id, true));
 
         loop {
             // Check if election has timed out
