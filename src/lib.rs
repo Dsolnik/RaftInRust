@@ -340,7 +340,7 @@ impl RaftNode {
     fn handle_msg(&mut self, msg: &Message, node: &NetworkNode) -> Result<(), zmq::Error> {
         match msg {
             Message::RequestVoteReply(_, vote) => {
-                if *vote {
+                if *vote && self.role == Role::Candidate {
                     self.add_to_voters(node.node_id);
                     if let Some(voters) = &self.voters {
                         if voters.len() >= (self.network_nodes.len() + 1) / 2 {
