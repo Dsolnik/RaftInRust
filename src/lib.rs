@@ -2,7 +2,8 @@ use rand::Rng;
 use serde;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::collections::HashSet;
+use std::cmp;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Instant;
 use zmq;
@@ -68,24 +69,60 @@ struct RequestVoteRPC {
 struct AppendEntriesRPC {
     term: u32,
     prev_log_index: u32,
+    prev_log_term: u32,
     //  TODO: Should be an Entry
     entries: Vec<u32>,
     leader_commit: u32,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
 enum Operation {
     Get,
     Set,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug)]
+struct Log {
+    entries: Vec<Entry>,
+}
+
+impl Log {
+    fn new() -> Log {
+        Log { entries: vec![] }
+    }
+
+    fn get_index(&self, index: usize) -> Option<&Entry> {
+        if index == 0 {
+            None
+        } else {
+            self.entries.get(index - 1)
+        }
+    }
+
+    fn get_last_index(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn add_entry(&mut self, entry: Entry) {
+        self.entries.push(entry);
+    }
+
+    fn delete_at_and_after_index(&mut self, index: usize) {
+        while self.entries.len() >= index {
+            self.entries.pop();
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Entry {
     op: Operation,
     key: String,
     value: String,
+    term: u32,
 }
 
+#[derive(PartialEq)]
 enum Role {
     Candidate,
     Leader,
@@ -100,13 +137,13 @@ pub struct RaftNode {
     // Persistent State
     current_term: u32,
     voted_for: Option<u32>,
-    log: Vec<Entry>,
+    log: Log,
     // Volatile State
     commit_index: u32,
     last_applied: u32,
     // Leader State
-    next_index: Vec<u32>,
-    match_index: Vec<u32>,
+    next_index: Option<HashMap<NodeId, u32>>,
+    match_index: Option<HashMap<NodeId, u32>>,
     // timeout
     timeout: i32,
     timeout_instant: Instant,
@@ -161,11 +198,11 @@ impl RaftNode {
             node_id,
             current_term: 0,
             voted_for: None,
-            log: vec![],
+            log: Log::new(),
             commit_index: 0,
             last_applied: 0,
-            next_index: vec![],
-            match_index: vec![],
+            next_index: None,
+            match_index: None,
             timeout: RaftNode::get_new_timeout_time(5000, 10000),
             timeout_instant: Instant::now(),
             voters: None,
@@ -216,6 +253,13 @@ impl RaftNode {
         voters.insert(node);
     }
 
+    /// Send out an append entries to every follower
+    fn send_append_entries(&self) {
+        assert!(self.role == Role::Leader);
+        // let msg = Message::AppendEntries()
+        // self.broadcast_message(msg: &Message)
+    }
+
     /// Start the candidacy of the current node.
     fn start_candidacy(&mut self) -> Result<(), zmq::Error> {
         println!("Node {}: starting candidacy", self.node_id);
@@ -243,11 +287,40 @@ impl RaftNode {
     /// Change the role of the current node to `role`.
     fn change_role(&mut self, role: Role) {
         match role {
-            Role::Candidate => self.voters = Some(HashSet::new()),
-            Role::Follower => {}
-            Role::Leader => {}
+            Role::Candidate => {
+                self.voters = Some(HashSet::new());
+            }
+            Role::Follower => {
+                self.voters = None;
+                self.next_index = None;
+                self.match_index = None;
+            }
+            Role::Leader => {
+                self.voters = None;
+                // for each server, index of the next log entry to send to that server
+                // (initialized to leader last log index + 1)
+                let mut next_index = HashMap::new();
+                let next_log_index: u32 = (self.log.get_last_index() + 1) as u32;
+                for node in self.network_nodes.iter() {
+                    next_index.insert(node.node_id, next_log_index);
+                }
+                self.next_index = Some(next_index);
+
+                // for each server, index of highest log entry known to be replicated on
+                // server (initialized to 0, increases monotonically)
+                let mut match_index = HashMap::new();
+                for node in self.network_nodes.iter() {
+                    match_index.insert(node.node_id, 0);
+                }
+                self.match_index = Some(match_index);
+            }
         }
         self.role = role;
+    }
+
+    /// Set the commit index, applying entries if necessary
+    fn set_commit_index(&mut self, new_index: u32) {
+        self.commit_index = new_index;
     }
 
     /// Update the current term to reflect the most up to date information about the term.
@@ -284,7 +357,7 @@ impl RaftNode {
                         self.node_id,
                         Message::RequestVoteReply(self.current_term, false),
                     )?;
-                } else if self.voted_for.is_none() {
+                } else if self.voted_for.is_none() && self.role != Role::Leader {
                     // TODO: step 2 conditions (page 4)
                     // 2. If votedFor is null or candidateId, and candidate’s log is at
                     //  least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
@@ -299,6 +372,58 @@ impl RaftNode {
                         Message::RequestVoteReply(self.current_term, false),
                     )?;
                 }
+            }
+            Message::AppendEntries(append_entries) => {
+                if append_entries.term == self.current_term && self.role == Role::Candidate {
+                    // If AppendEntries RPC received from new leader: convert to follower
+                    self.change_role(Role::Follower);
+                }
+
+                // 1. Reply false if term < currentTerm (§5.1)
+                if append_entries.term < self.current_term {
+                    node.send_message(
+                        self.node_id,
+                        Message::AppendEntriesReply(self.current_term, false),
+                    )?;
+                }
+
+                // We recieved communication from the leader so we restart the timeout!
+                self.restart_timeout();
+
+                // 2. Reply false if log doesn’t contain an entry at prevLogIndex
+                // whose term matches prevLogTerm (§5.3)
+                if (self.log.get_last_index() as u32) < append_entries.prev_log_index {
+                    if append_entries.prev_log_index == 0 {
+                        node.send_message(
+                            self.node_id,
+                            Message::AppendEntriesReply(self.current_term, false),
+                        )?;
+                    } else if self
+                        .log
+                        .get_index(append_entries.prev_log_index as usize)
+                        .unwrap()
+                        .term
+                        != append_entries.prev_log_term
+                    {
+                        node.send_message(
+                            self.node_id,
+                            Message::AppendEntriesReply(self.current_term, false),
+                        )?;
+                        self.log
+                            .delete_at_and_after_index(append_entries.prev_log_index as usize);
+                    }
+                    // 3. If an existing entry conflicts with a new one (same index
+                    // but different terms), delete the existing entry and all that
+                    // follow it (§5.3)
+                }
+
+                // 4. Append any new entries not already in the log
+                if self.commit_index < append_entries.leader_commit {
+                    self.set_commit_index(cmp::min(append_entries.leader_commit, 100));
+                }
+                // 5. If leaderCommit > commitIndex, set commitIndex =
+                // min(leaderCommit, index of last new entry)
+                self.restart_timeout()
             }
             _ => {}
         }
