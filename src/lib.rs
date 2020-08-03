@@ -36,7 +36,7 @@ impl NetworkNode {
 
     /// Send a message to this node
     fn send_message(&self, from: NodeId, msg: Message) -> Result<(), zmq::Error> {
-        let message = serde_json::to_string(&NetworkMessage { from, msg: msg })
+        let message = serde_json::to_string(&NetworkMessage { from, msg })
             .expect("Error serializing Message to send");
         self.sender.send(&message, 0)?;
         Ok(())
@@ -70,15 +70,8 @@ struct AppendEntriesRPC {
     term: u32,
     prev_log_index: u32,
     prev_log_term: u32,
-    //  TODO: Should be an Entry
-    entries: Vec<u32>,
+    entries: Vec<Entry>,
     leader_commit: u32,
-}
-
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
-enum Operation {
-    Get,
-    Set,
 }
 
 #[derive(Debug)]
@@ -107,6 +100,10 @@ impl Log {
         self.entries.push(entry);
     }
 
+    fn get_last_entry(&self) -> Option<&Entry> {
+        self.entries.last()
+    }
+
     fn delete_at_and_after_index(&mut self, index: usize) {
         while self.entries.len() >= index {
             self.entries.pop();
@@ -115,8 +112,8 @@ impl Log {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+// Set the value of `key` to `value`
 struct Entry {
-    op: Operation,
     key: String,
     value: String,
     term: u32,
@@ -253,11 +250,57 @@ impl RaftNode {
         voters.insert(node);
     }
 
-    /// Send out an append entries to every follower
-    fn send_append_entries(&self) {
+    fn send_append_entries_to_node(
+        &self,
+        node: &NetworkNode,
+        next_index: u32,
+    ) -> Result<(), zmq::Error> {
         assert!(self.role == Role::Leader);
-        // let msg = Message::AppendEntries()
-        // self.broadcast_message(msg: &Message)
+        let entries: Vec<Entry> = self
+            .log
+            .entries
+            .iter()
+            .skip((next_index - 1) as usize)
+            .cloned()
+            .collect();
+        let msg = Message::AppendEntries(AppendEntriesRPC {
+            term: self.current_term,
+            entries,
+            leader_commit: self.commit_index,
+            prev_log_index: next_index - 1,
+            prev_log_term: {
+                if next_index - 1 == 0 {
+                    0
+                } else {
+                    self.log.get_index((next_index - 1) as usize).unwrap().term
+                }
+            },
+        });
+        node.send_message(self.node_id, msg)?;
+        // TODO: wait for reply!
+        //    • If successful: update nextIndex and matchIndex forfollower (§5.3)
+        //    • If AppendEntries fails because of log inconsistency: decrement nextIndex and retry (§5.3)
+        Ok(())
+    }
+
+    /// Send out an append entries to every follower
+    fn send_append_entries(&self, heartbeat: bool) -> Result<(), zmq::Error> {
+        assert!(self.role == Role::Leader);
+        for node in self.network_nodes.iter() {
+            // If last log index ≥ nextIndex for a follower: sendAppendEntries RPC with log
+            // entries starting at nextIndex
+            let next_index = *self
+                .next_index
+                .as_ref()
+                .expect("We are leader so next_index should be there")
+                .get(&node.node_id)
+                .expect("Node should be there");
+
+            if next_index <= self.log.get_last_index() as u32 || heartbeat {
+                self.send_append_entries_to_node(&node, next_index)?;
+            }
+        }
+        Ok(())
     }
 
     /// Start the candidacy of the current node.
@@ -358,9 +401,29 @@ impl RaftNode {
                         Message::RequestVoteReply(self.current_term, false),
                     )?;
                 } else if self.voted_for.is_none() && self.role != Role::Leader {
-                    // TODO: step 2 conditions (page 4)
                     // 2. If votedFor is null or candidateId, and candidate’s log is at
                     //  least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
+
+                    // Raft determines which of two logs is more up-to-date
+                    // by comparing the index and term of the last entries in the
+                    // logs. If the logs have last entries with different terms, then
+                    // the log with the later term is more up-to-date. If the logs
+                    // end with the same term, then whichever log is longer is
+                    // more up-to-date.
+
+                    if let Some(entry) = self.log.get_last_entry() {
+                        if entry.term > vote_request.last_log_term
+                            || (entry.term == vote_request.last_log_term
+                                && self.log.get_last_index() > vote_request.last_log_index as usize)
+                        {
+                            node.send_message(
+                                self.node_id,
+                                Message::RequestVoteReply(self.current_term, false),
+                            )?;
+                            return Ok(());
+                        }
+                    }
+
                     self.voted_for = Some(node.node_id);
                     node.send_message(
                         self.node_id,
@@ -385,6 +448,7 @@ impl RaftNode {
                         self.node_id,
                         Message::AppendEntriesReply(self.current_term, false),
                     )?;
+                    return Ok(());
                 }
 
                 // We recieved communication from the leader so we restart the timeout!
@@ -393,37 +457,72 @@ impl RaftNode {
                 // 2. Reply false if log doesn’t contain an entry at prevLogIndex
                 // whose term matches prevLogTerm (§5.3)
                 if (self.log.get_last_index() as u32) < append_entries.prev_log_index {
-                    if append_entries.prev_log_index == 0 {
-                        node.send_message(
-                            self.node_id,
-                            Message::AppendEntriesReply(self.current_term, false),
-                        )?;
-                    } else if self
-                        .log
-                        .get_index(append_entries.prev_log_index as usize)
-                        .unwrap()
-                        .term
-                        != append_entries.prev_log_term
+                    // If there are no log entries written yet.
+                    node.send_message(
+                        self.node_id,
+                        Message::AppendEntriesReply(self.current_term, false),
+                    )?;
+                    return Ok(());
+                } else if self
+                    .log
+                    .get_index(append_entries.prev_log_index as usize)
+                    .unwrap()
+                    .term
+                    != append_entries.prev_log_term
+                {
+                    node.send_message(
+                        self.node_id,
+                        Message::AppendEntriesReply(self.current_term, false),
+                    )?;
+                    return Ok(());
+                }
+
+                // 3. If an existing entry conflicts with a new one (same index
+                // but different terms), delete the existing entry and all that
+                // follow it (§5.3)
+                let mut current_index = append_entries.prev_log_index + 1;
+                while current_index <= self.log.get_last_index() as u32 {
+                    match append_entries
+                        .entries
+                        .get((current_index - (append_entries.prev_log_index + 1)) as usize)
                     {
-                        node.send_message(
-                            self.node_id,
-                            Message::AppendEntriesReply(self.current_term, false),
-                        )?;
-                        self.log
-                            .delete_at_and_after_index(append_entries.prev_log_index as usize);
+                        Some(entry) => {
+                            if self
+                                .log
+                                .get_index(current_index as usize)
+                                .expect("Expected to be able to get the index")
+                                .term
+                                != entry.term
+                            {
+                                self.log.delete_at_and_after_index(current_index as usize);
+                                break;
+                            }
+                        }
+                        // We have more entries in our local `self.entries` than the leader has. So we must remove them.
+                        None => {
+                            self.log.delete_at_and_after_index(current_index as usize);
+                            break;
+                        }
                     }
-                    // 3. If an existing entry conflicts with a new one (same index
-                    // but different terms), delete the existing entry and all that
-                    // follow it (§5.3)
+                    current_index += 1;
                 }
 
                 // 4. Append any new entries not already in the log
+                self.log.entries.extend(
+                    append_entries
+                        .entries
+                        .iter()
+                        .cloned()
+                        .skip((current_index - (append_entries.prev_log_index + 1)) as usize),
+                );
+
+                // 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
                 if self.commit_index < append_entries.leader_commit {
-                    self.set_commit_index(cmp::min(append_entries.leader_commit, 100));
+                    self.set_commit_index(cmp::min(
+                        append_entries.leader_commit,
+                        self.log.get_last_index() as u32,
+                    ));
                 }
-                // 5. If leaderCommit > commitIndex, set commitIndex =
-                // min(leaderCommit, index of last new entry)
-                self.restart_timeout()
             }
             _ => {}
         }
@@ -450,7 +549,7 @@ impl RaftNode {
             if self.time_before_timeout() <= 0 {
                 match self.role {
                     Role::Candidate | Role::Follower => self.start_candidacy()?,
-                    Role::Leader => {}
+                    Role::Leader => self.send_append_entries(true)?,
                 }
                 continue;
             }
